@@ -1,0 +1,29 @@
+[project]
+name = "citation-tracker"
+version = "0.1.0"
+description = "Cross-check citations across Google Scholar and Scopus to recover lost Scopus citations"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "bibtexparser<2.0.0",
+    "pydantic>=2.13.5",
+    "python-dotenv>=1.2.4",
+    "rapidfuzz>=3.14.6",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+    "scholarly>=1.7.11",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+citation-tracker = "citation_tracker.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

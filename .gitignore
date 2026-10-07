@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables & API keys
+.env
+
+# Cache
+.cache/
+.pytest_cache/
+
+# Generated Citation Tracker output
+citations_report*.csv
+missing_citations*.csv
+scopus_support_letter*.txt
+scratch/
+
