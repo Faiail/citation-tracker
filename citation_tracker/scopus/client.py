@@ -5,12 +5,14 @@ import os
 import re
 import time
 from typing import Dict, List, Optional, Set
+from dotenv import load_dotenv
 import requests
 from rapidfuzz import fuzz
 
 from citation_tracker.cache import DiskCache
 from citation_tracker.models import AuthorProfile, ScopusPaper
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 SCOPUS_SEARCH_URL = "https://api.elsevier.com/content/search/scopus"
@@ -39,7 +41,7 @@ class ScopusClient:
         if not self.api_key:
             raise ScopusAPIError(
                 "Elsevier API Key is required. Set the ELSEVIER_API_KEY environment variable, "
-                "add it to a .env file, or pass --scopus-api-key."
+                "add it to a .env file, or pass --api-key."
             )
         headers = {
             "X-ELS-APIKey": self.api_key,
@@ -183,9 +185,10 @@ class ScopusClient:
                 title = entry.get("dc:title", "").strip()
                 doi = entry.get("prism:doi")
                 venue = entry.get("prism:publicationName")
+                authors_str = entry.get("dc:creator")
                 date_str = entry.get("prism:coverDate", "")
                 year = int(date_str[:4]) if date_str and len(date_str) >= 4 and date_str[:4].isdigit() else None
-                cited_by_count = int(entry.get("citedby-count", 0))
+                cited_by_count = int(entry.get("citedby-count", 0)) if entry.get("citedby-count") else 0
                 url = None
                 for link in entry.get("link", []):
                     if link.get("@ref") == "scopus":
@@ -199,6 +202,7 @@ class ScopusClient:
                         doi=doi,
                         year=year,
                         venue=venue,
+                        authors=authors_str,
                         url=url,
                         cited_by_count=cited_by_count,
                     )
@@ -213,7 +217,10 @@ class ScopusClient:
         return papers
 
     def get_citing_eids_for_paper(self, cited_eid: str) -> Set[str]:
-        """Query Scopus for all documents that cite a given Scopus EID (via refeid query)."""
+        """Attempt to query Scopus for citing EIDs (via refeid query).
+        
+        Returns an empty set if the user's API key does not have entitlement for refeid.
+        """
         clean_eid = cited_eid.strip()
         cache_key = f"citing_eids_{clean_eid}"
         cached = self.cache.get("scopus_citing_eids", cache_key)
@@ -224,8 +231,6 @@ class ScopusClient:
         count = 25
         start = 0
         headers = self._headers()
-
-        # refeid can accept 2-s2.0-xxx or just the numeric part
         query_val = clean_eid
 
         while True:
@@ -236,12 +241,16 @@ class ScopusClient:
             }
             try:
                 resp = requests.get(SCOPUS_SEARCH_URL, headers=headers, params=params, timeout=25)
+                if resp.status_code == 400:
+                    # 'refeid' restriction not allowed for standard/personal keys
+                    logger.debug("refeid query restricted for this API key. Falling back to reference checks.")
+                    break
                 if resp.status_code == 429:
                     raise ScopusAPIError("Elsevier API quota exceeded (Rate limit 429).")
                 resp.raise_for_status()
                 data = resp.json()
             except requests.RequestException as e:
-                logger.warning(f"Error querying Scopus refeid for {clean_eid}: {e}")
+                logger.debug(f"refeid query unavailable: {e}")
                 break
 
             search_results = data.get("search-results", {})
@@ -263,6 +272,38 @@ class ScopusClient:
 
         self.cache.set("scopus_citing_eids", cache_key, list(citing_eids))
         return citing_eids
+
+    def is_citation_tracked(
+        self,
+        citing_eid: str,
+        author_last_name: str,
+    ) -> bool:
+        """Check if a citing paper indexed in Scopus references the author's name.
+        
+        This works on standard/personal API keys without requiring refeid entitlements.
+        """
+        clean_eid = citing_eid.strip()
+        clean_author = author_last_name.strip()
+        cache_key = f"tracked_{clean_eid}_{clean_author.lower()}"
+        cached = self.cache.get("scopus_citation_tracked", cache_key)
+        if cached is not None:
+            return bool(cached)
+
+        headers = self._headers()
+        query = f'EID({clean_eid}) and REF("{clean_author}")'
+        params = {"query": query, "count": 1}
+        try:
+            resp = requests.get(SCOPUS_SEARCH_URL, headers=headers, params=params, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                total = int(data.get("search-results", {}).get("opensearch:totalResults", 0))
+                is_tracked = total > 0
+                self.cache.set("scopus_citation_tracked", cache_key, is_tracked)
+                return is_tracked
+        except Exception as e:
+            logger.debug(f"Error checking citation reference in Scopus for {clean_eid}: {e}")
+
+        return False
 
     def search_paper(self, doi: Optional[str] = None, title: Optional[str] = None) -> Optional[ScopusPaper]:
         """Search whether a document is indexed in Scopus by DOI or title."""
@@ -306,9 +347,8 @@ class ScopusClient:
                             if "error" in entry:
                                 continue
                             candidate_paper = self._entry_to_paper(entry)
-                            # Verify fuzzy match ratio to prevent false positives
                             ratio = fuzz.token_sort_ratio(title.lower(), candidate_paper.title.lower())
-                            if ratio >= 85:
+                            if ratio >= 80:
                                 self.cache.set("scopus_search_paper", cache_key, candidate_paper.model_dump())
                                 return candidate_paper
                 except Exception as e:
@@ -323,6 +363,7 @@ class ScopusClient:
         title = entry.get("dc:title", "").strip()
         doi = entry.get("prism:doi")
         venue = entry.get("prism:publicationName")
+        authors_str = entry.get("dc:creator")
         date_str = entry.get("prism:coverDate", "")
         year = int(date_str[:4]) if date_str and len(date_str) >= 4 and date_str[:4].isdigit() else None
         cited_by_count = int(entry.get("citedby-count", 0)) if entry.get("citedby-count") else 0
@@ -337,13 +378,13 @@ class ScopusClient:
             doi=doi,
             year=year,
             venue=venue,
+            authors=authors_str,
             url=url,
             cited_by_count=cited_by_count,
         )
 
     def _clean_title_for_query(self, title: str) -> str:
-        """Strip punctuation and curly brackets that break Scopus query parser."""
+        """Strip punctuation and brackets that break Scopus query parser."""
         t = re.sub(r'["{}\[\]\(\)]', ' ', title)
         t = re.sub(r'\s+', ' ', t).strip()
         return t
-

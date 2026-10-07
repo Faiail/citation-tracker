@@ -178,6 +178,16 @@ def check(
             console.print(f"[bold red]Scopus API Error:[/bold red] {e}")
             raise typer.Exit(code=1)
 
+    if not scopus_papers:
+        console.print(f"[bold red]Error:[/bold red] Found 0 publications in Scopus for Author ID '{scopus_id}'.")
+        if scopus_id and len(scopus_id) <= 9:
+            console.print(
+                f"[bold yellow]Tip:[/bold yellow] '{scopus_id}' appears to be an Affiliation ID (e.g. University ID), not a Scopus Author ID.\n"
+                "Scopus Author IDs are typically 10–11 digits (e.g. 57842020300).\n"
+                "You can find your Scopus Author ID using: [bold]uv run citation-tracker search-author --name 'Your Name'[/bold]"
+            )
+        raise typer.Exit(code=1)
+
     console.print(f"[green]✓[/green] Found [bold]{len(scopus_papers)}[/bold] Scopus publications.")
 
     # 2. Resolve Google Scholar Profile
@@ -230,6 +240,13 @@ def check(
               border_style="blue")
     )
 
+    # Determine author's surname
+    author_last = None
+    if author_display_name:
+        author_last = author_display_name.strip().replace(",", " ").split()[-1]
+    elif scopus_papers and scopus_papers[0].authors:
+        author_last = scopus_papers[0].authors.split(",")[0].strip().split()[-1]
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -243,6 +260,7 @@ def check(
         checker = CitationCrossChecker(
             scopus_client=scopus_client,
             scholar_client=scholar_client,
+            author_last_name=author_last,
             progress_callback=update_progress,
         )
 

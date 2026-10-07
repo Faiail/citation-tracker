@@ -38,13 +38,16 @@ def match_scholar_paper(scopus_paper: ScopusPaper, scholar_papers: List[ScholarP
 
     for sp in scholar_papers:
         candidate_title = sp.title.lower().strip()
-        score = fuzz.token_sort_ratio(target_title, candidate_title)
+        # Clean leading punctuation (e.g. ': title')
+        candidate_title = candidate_title.lstrip(": -–—")
+        target_clean = target_title.lstrip(": -–—")
+        score = fuzz.token_sort_ratio(target_clean, candidate_title)
         if score > best_score:
             best_score = score
             best_match = sp
 
-    # Require at least 80% similarity threshold
-    if best_score >= 80 and best_match:
+    # Require at least 75% similarity threshold
+    if best_score >= 75 and best_match:
         return best_match
     return None
 
@@ -56,10 +59,12 @@ class CitationCrossChecker:
         self,
         scopus_client: ScopusClient,
         scholar_client: ScholarClient,
+        author_last_name: Optional[str] = None,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ):
         self.scopus_client = scopus_client
         self.scholar_client = scholar_client
+        self.author_last_name = author_last_name
         self.progress_callback = progress_callback
 
     def check(
@@ -73,7 +78,7 @@ class CitationCrossChecker:
         For each Scopus paper:
           1. Match with corresponding Google Scholar paper.
           2. Retrieve Google Scholar citing documents.
-          3. Query Scopus for known citing documents (via refeid).
+          3. Query Scopus for known citing documents (via refeid or reference check).
           4. For each Scholar citing document:
              - Check if indexed in Scopus (by DOI or Title).
              - If indexed, check if Scopus tracks the citation link.
@@ -102,12 +107,12 @@ class CitationCrossChecker:
                 continue
 
             # 2. Get known Scopus citing documents for this paper
+            scopus_citing_eids = set()
             try:
                 scopus_citing_eids = self.scopus_client.get_citing_eids_for_paper(scopus_paper.eid)
                 scopus_paper.scopus_citing_eids = scopus_citing_eids
             except Exception as e:
-                logger.warning(f"Could not retrieve Scopus citing EIDs for {scopus_paper.eid}: {e}")
-                scopus_citing_eids = set()
+                logger.debug(f"Could not retrieve Scopus citing EIDs for {scopus_paper.eid}: {e}")
 
             # 3. Retrieve Google Scholar citing papers
             try:
@@ -159,11 +164,20 @@ class CitationCrossChecker:
         # Citing paper IS indexed in Scopus!
         # Now check: does Scopus track this citation link?
         citing_eid = citing_scopus_paper.eid
-        # Check against refeid set (handle potential '2-s2.0-' prefix difference)
         clean_citing_eid = citing_eid.replace("2-s2.0-", "")
         clean_known_eids = {e.replace("2-s2.0-", "") for e in known_scopus_citing_eids}
 
-        is_tracked = clean_citing_eid in clean_known_eids
+        is_tracked = False
+        if clean_known_eids:
+            is_tracked = clean_citing_eid in clean_known_eids
+        else:
+            # Fallback to direct reference verification
+            author_last = self.author_last_name
+            if not author_last and cited_paper.authors:
+                # Extract first word of author (typically surname in Scopus dc:creator)
+                author_last = cited_paper.authors.split(",")[0].strip().split()[-1]
+            if author_last:
+                is_tracked = self.scopus_client.is_citation_tracked(citing_eid, author_last)
 
         if is_tracked:
             return CitationRecord(
@@ -182,4 +196,3 @@ class CitationCrossChecker:
                 status=DiscrepancyStatus.MISSING_IN_SCOPUS,
                 notes="LOST CITATION: Citing paper is indexed in Scopus, but reference link is missing in Scopus database",
             )
-
