@@ -1,8 +1,11 @@
-"""Google Scholar client for retrieving author publications and citing papers."""
-
+import glob
 import logging
+import os
 import random
 import re
+import shutil
+import sqlite3
+import tempfile
 import time
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +25,42 @@ DEFAULT_USER_AGENT = (
 )
 
 
+def auto_detect_scholar_cookies() -> Optional[str]:
+    """Attempt to detect Google session cookies from local browser profiles (Firefox)."""
+    patterns = [
+        os.path.expanduser("~/.mozilla/firefox/*/cookies.sqlite"),
+        os.path.expanduser("~/snap/firefox/common/.mozilla/firefox/*/cookies.sqlite"),
+        os.path.expanduser("~/.var/app/org.mozilla.firefox/.mozilla/firefox/*/cookies.sqlite"),
+    ]
+    for pattern in patterns:
+        for db_path in glob.glob(pattern):
+            if not os.path.isfile(db_path):
+                continue
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp_file:
+                    tmp_path = tmp_file.name
+                shutil.copy2(db_path, tmp_path)
+                conn = sqlite3.connect(tmp_path)
+                cur = conn.cursor()
+                cur.execute("SELECT name, value FROM moz_cookies WHERE host LIKE '%google.com%'")
+                rows = cur.fetchall()
+                conn.close()
+                if rows:
+                    cookie_str = "; ".join(f"{k}={v}" for k, v in rows)
+                    logger.info("Automatically detected Google session cookies from Firefox.")
+                    return cookie_str
+            except Exception as e:
+                logger.debug(f"Could not read Firefox cookies from {db_path}: {e}")
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+    return None
+
+
 class ScholarBlockedError(Exception):
     """Raised when Google Scholar returns a CAPTCHA or blocks requests."""
     pass
@@ -37,7 +76,7 @@ class ScholarClient:
         cache: Optional[DiskCache] = None,
     ):
         self.delay = delay
-        self.cookie = cookie
+        self.cookie = cookie or os.getenv("SCHOLAR_COOKIE") or auto_detect_scholar_cookies()
         self.cache = cache or DiskCache()
         self.session = requests.Session()
         self.session.headers.update({
