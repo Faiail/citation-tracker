@@ -226,20 +226,33 @@ class ScholarClient:
             start += 10
             self._polite_sleep()
 
-        self.cache.set("scholar_citations", cache_key, [c.model_dump() for c in citations])
+        # Only cache if citations were retrieved
+        if citations:
+            self.cache.set("scholar_citations", cache_key, [c.model_dump() for c in citations])
         return citations
 
     def _get_html(self, url: str) -> str:
-        """Fetch HTML content with error detection for Google CAPTCHA."""
+        """Fetch HTML content with error detection for Google CAPTCHA and soft-blocks."""
         try:
             resp = self.session.get(url, timeout=20)
         except requests.RequestException as e:
             raise ScholarBlockedError(f"Network error connecting to Google Scholar: {e}")
 
-        if resp.status_code == 429 or "recaptcha" in resp.text.lower() or "unusual traffic" in resp.text.lower():
+        lower_body = resp.text.lower()
+        if (
+            resp.status_code in (403, 429)
+            or "recaptcha" in lower_body
+            or "unusual traffic" in lower_body
+            or "can't perform the operation" in lower_body
+            or "system can't perform" in lower_body
+        ):
             raise ScholarBlockedError(
-                "Google Scholar has temporarily rate-limited or shown a CAPTCHA for this IP address. "
-                "Consider increasing --scholar-delay (e.g. 5.0) or passing a browser cookie via --scholar-cookie."
+                "Google Scholar has temporarily rate-limited citing requests from this IP address "
+                "('The system can't perform the operation now').\n"
+                "To resolve this, you can:\n"
+                "  1. Pass your browser's Google Scholar cookie with --scholar-cookie 'YOUR_COOKIE'\n"
+                "  2. Increase the delay with --scholar-delay 5.0\n"
+                "  3. Or use --source all to automatically augment with OpenAlex academic citations."
             )
 
         resp.raise_for_status()

@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Citation Tracker (Scholar)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "args": [
+                "check",
+                "--scopus-id",
+                "57842020300",
+                "--scholar-id",
+                "4lwfOooAAAAJ",
+                "--clear-cache"
+            ],
+            "justMyCode": true
+        }
+    ]
+}

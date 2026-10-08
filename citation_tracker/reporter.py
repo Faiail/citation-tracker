@@ -121,9 +121,9 @@ def print_rich_summary(records: List[CitationRecord], author_name: str = "") -> 
     summary_table.add_column("Description", style="dim")
 
     summary_table.add_row(
-        "Total Scholar Citations Inspected",
+        "Total Citations Inspected",
         str(total),
-        "Total citations examined from Google Scholar",
+        "Total citations examined across your publications",
     )
     summary_table.add_row(
         "Tracked in Scopus",

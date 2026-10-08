@@ -2,6 +2,7 @@
 
 import logging
 import re
+import unicodedata
 from typing import Callable, List, Optional
 from rapidfuzz import fuzz
 
@@ -12,6 +13,7 @@ from citation_tracker.models import (
     ScholarPaper,
     ScopusPaper,
 )
+from citation_tracker.openalex_client import OpenAlexClient
 from citation_tracker.scopus.client import ScopusClient
 from citation_tracker.scholar.client import ScholarClient
 
@@ -29,19 +31,23 @@ def extract_doi_from_text_or_url(text: Optional[str]) -> Optional[str]:
     return None
 
 
+def normalize_title(title: str) -> str:
+    """Normalize whitespace, unicode non-breaking spaces, and leading punctuation."""
+    clean = unicodedata.normalize("NFKD", title).replace("\xa0", " ")
+    clean = re.sub(r"\s+", " ", clean).strip().lower()
+    return clean.lstrip(": -–—")
+
+
 def match_scholar_paper(scopus_paper: ScopusPaper, scholar_papers: List[ScholarPaper]) -> Optional[ScholarPaper]:
     """Find the best matching Scholar paper for a Scopus paper using fuzzy title comparison."""
     best_match = None
     best_score = 0.0
 
-    target_title = scopus_paper.title.lower().strip()
+    target_clean = normalize_title(scopus_paper.title)
 
     for sp in scholar_papers:
-        candidate_title = sp.title.lower().strip()
-        # Clean leading punctuation (e.g. ': title')
-        candidate_title = candidate_title.lstrip(": -–—")
-        target_clean = target_title.lstrip(": -–—")
-        score = fuzz.token_sort_ratio(target_clean, candidate_title)
+        candidate_clean = normalize_title(sp.title)
+        score = fuzz.token_sort_ratio(target_clean, candidate_clean)
         if score > best_score:
             best_score = score
             best_match = sp
@@ -53,17 +59,19 @@ def match_scholar_paper(scopus_paper: ScopusPaper, scholar_papers: List[ScholarP
 
 
 class CitationCrossChecker:
-    """Engine to perform the cross-reference check between Scopus and Scholar."""
+    """Engine to perform the cross-reference check between Scopus and Scholar/OpenAlex."""
 
     def __init__(
         self,
         scopus_client: ScopusClient,
-        scholar_client: ScholarClient,
+        scholar_client: Optional[ScholarClient] = None,
+        openalex_client: Optional[OpenAlexClient] = None,
         author_last_name: Optional[str] = None,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ):
         self.scopus_client = scopus_client
         self.scholar_client = scholar_client
+        self.openalex_client = openalex_client
         self.author_last_name = author_last_name
         self.progress_callback = progress_callback
 
@@ -73,17 +81,7 @@ class CitationCrossChecker:
         scholar_papers: List[ScholarPaper],
         max_papers: Optional[int] = None,
     ) -> List[CitationRecord]:
-        """Perform cross-check across all publications.
-        
-        For each Scopus paper:
-          1. Match with corresponding Google Scholar paper.
-          2. Retrieve Google Scholar citing documents.
-          3. Query Scopus for known citing documents (via refeid or reference check).
-          4. For each Scholar citing document:
-             - Check if indexed in Scopus (by DOI or Title).
-             - If indexed, check if Scopus tracks the citation link.
-             - Mark as MISSING_IN_SCOPUS if indexed in Scopus but citation not linked.
-        """
+        """Perform cross-check across all publications."""
         records: List[CitationRecord] = []
         papers_to_check = scopus_papers[:max_papers] if max_papers else scopus_papers
         total_papers = len(papers_to_check)
@@ -97,16 +95,9 @@ class CitationCrossChecker:
                 )
 
             # 1. Match Scopus paper with Scholar paper
-            matched_scholar = match_scholar_paper(scopus_paper, scholar_papers)
-            if not matched_scholar:
-                logger.info(f"No Google Scholar match found for: '{scopus_paper.title}'")
-                continue
+            matched_scholar = match_scholar_paper(scopus_paper, scholar_papers) if scholar_papers else None
 
-            if not matched_scholar.cites_id or matched_scholar.cited_by_count == 0:
-                logger.info(f"Paper '{scopus_paper.title}' has no citations on Google Scholar.")
-                continue
-
-            # 2. Get known Scopus citing documents for this paper
+            # 2. Get known Scopus citing documents for this paper (if refeid enabled)
             scopus_citing_eids = set()
             try:
                 scopus_citing_eids = self.scopus_client.get_citing_eids_for_paper(scopus_paper.eid)
@@ -114,18 +105,41 @@ class CitationCrossChecker:
             except Exception as e:
                 logger.debug(f"Could not retrieve Scopus citing EIDs for {scopus_paper.eid}: {e}")
 
-            # 3. Retrieve Google Scholar citing papers
-            try:
-                scholar_citations = self.scholar_client.get_citing_papers(
-                    cites_id=matched_scholar.cites_id,
-                    max_citations=150,
-                )
-            except Exception as e:
-                logger.error(f"Failed to fetch Scholar citations for '{scopus_paper.title}': {e}")
+            # 3. Retrieve citing papers from Scholar
+            citing_candidates: List[ScholarCitation] = []
+            seen_titles = set()
+
+            if self.scholar_client and matched_scholar and matched_scholar.cites_id:
+                try:
+                    scholar_citings = self.scholar_client.get_citing_papers(
+                        cites_id=matched_scholar.cites_id,
+                        max_citations=150,
+                    )
+                    for c in scholar_citings:
+                        norm = normalize_title(c.title)
+                        if norm not in seen_titles:
+                            seen_titles.add(norm)
+                            citing_candidates.append(c)
+                except Exception as e:
+                    logger.debug(f"Scholar citing retrieval for '{scopus_paper.title}': {e}")
+
+            # Also augment with OpenAlex if available
+            if self.openalex_client and scopus_paper.doi:
+                try:
+                    openalex_citings = self.openalex_client.get_citing_papers_by_doi(scopus_paper.doi)
+                    for c in openalex_citings:
+                        norm = normalize_title(c.title)
+                        if norm not in seen_titles:
+                            seen_titles.add(norm)
+                            citing_candidates.append(c)
+                except Exception as e:
+                    logger.debug(f"OpenAlex citing retrieval for '{scopus_paper.title}': {e}")
+
+            if not citing_candidates:
                 continue
 
             # 4. Compare each citing paper
-            for citing in scholar_citations:
+            for citing in citing_candidates:
                 record = self._evaluate_citation(
                     cited_paper=scopus_paper,
                     citing=citing,
@@ -162,7 +176,6 @@ class CitationCrossChecker:
             )
 
         # Citing paper IS indexed in Scopus!
-        # Now check: does Scopus track this citation link?
         citing_eid = citing_scopus_paper.eid
         clean_citing_eid = citing_eid.replace("2-s2.0-", "")
         clean_known_eids = {e.replace("2-s2.0-", "") for e in known_scopus_citing_eids}
@@ -174,7 +187,6 @@ class CitationCrossChecker:
             # Fallback to direct reference verification
             author_last = self.author_last_name
             if not author_last and cited_paper.authors:
-                # Extract first word of author (typically surname in Scopus dc:creator)
                 author_last = cited_paper.authors.split(",")[0].strip().split()[-1]
             if author_last:
                 is_tracked = self.scopus_client.is_citation_tracked(citing_eid, author_last)

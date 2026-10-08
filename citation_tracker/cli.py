@@ -70,6 +70,12 @@ def check(
     max_papers: Optional[int] = typer.Option(
         None, "--max-papers", help="Limit number of papers to check (useful for quick testing)"
     ),
+    source: str = typer.Option(
+        "all", "--source", help="Citation retrieval source: 'all' (Scholar + OpenAlex), 'scholar', or 'openalex'"
+    ),
+    scholar_csv: Optional[Path] = typer.Option(
+        None, "--scholar-csv", help="Path to exported CSV of citations (e.g. from Harzing's Publish or Perish)"
+    ),
     no_cache: bool = typer.Option(
         False, "--no-cache", help="Disable query caching"
     ),
@@ -190,52 +196,55 @@ def check(
 
     console.print(f"[green]✓[/green] Found [bold]{len(scopus_papers)}[/bold] Scopus publications.")
 
-    # 2. Resolve Google Scholar Profile
+    # 2. Resolve Google Scholar Profile (if source != "openalex")
     scholar_papers = []
-    if not scholar_id:
-        if name:
-            console.print(f"[cyan]Searching Google Scholar profiles for '{name}'...[/cyan]")
-            candidates = scholar_client.search_author_by_name(name)
-            if not candidates:
+    if source != "openalex":
+        if not scholar_id:
+            if name:
+                console.print(f"[cyan]Searching Google Scholar profiles for '{name}'...[/cyan]")
+                candidates = scholar_client.search_author_by_name(name)
+                if not candidates:
+                    console.print(
+                        "[bold yellow]Warning:[/bold yellow] Could not auto-detect Google Scholar profile by name.\n"
+                        "Please provide your Scholar profile ID directly using [bold]--scholar-id YOUR_ID[/bold]\n"
+                        "(Found in your Google Scholar URL: scholar.google.com/citations?user=YOUR_ID)"
+                    )
+                    raise typer.Exit(code=1)
+                if len(candidates) == 1:
+                    scholar_id = candidates[0].scholar_id
+                    console.print(f"[green]✓[/green] Matched Scholar Profile: [bold]{candidates[0].name}[/bold] (ID: {scholar_id})")
+                else:
+                    table = Table(title="Select Google Scholar Profile")
+                    table.add_column("#", justify="right")
+                    table.add_column("Name")
+                    table.add_column("Scholar ID")
+                    table.add_column("Affiliation")
+                    for idx, cand in enumerate(candidates, start=1):
+                        table.add_row(str(idx), cand.name, cand.scholar_id, cand.affiliation or "N/A")
+                    console.print(table)
+                    choice = Prompt.ask("Enter number of your Scholar profile", default="1")
+                    scholar_id = candidates[int(choice) - 1].scholar_id
+            else:
                 console.print(
-                    "[bold yellow]Warning:[/bold yellow] Could not auto-detect Google Scholar profile by name.\n"
-                    "Please provide your Scholar profile ID directly using [bold]--scholar-id YOUR_ID[/bold]\n"
-                    "(Found in your Google Scholar URL: scholar.google.com/citations?user=YOUR_ID)"
+                    "[bold red]Error:[/bold red] Please provide --scholar-id (or run with --source openalex)."
                 )
                 raise typer.Exit(code=1)
-            if len(candidates) == 1:
-                scholar_id = candidates[0].scholar_id
-                console.print(f"[green]✓[/green] Matched Scholar Profile: [bold]{candidates[0].name}[/bold] (ID: {scholar_id})")
-            else:
-                table = Table(title="Select Google Scholar Profile")
-                table.add_column("#", justify="right")
-                table.add_column("Name")
-                table.add_column("Scholar ID")
-                table.add_column("Affiliation")
-                for idx, cand in enumerate(candidates, start=1):
-                    table.add_row(str(idx), cand.name, cand.scholar_id, cand.affiliation or "N/A")
-                console.print(table)
-                choice = Prompt.ask("Enter number of your Scholar profile", default="1")
-                scholar_id = candidates[int(choice) - 1].scholar_id
-        else:
-            console.print(
-                "[bold red]Error:[/bold red] Please provide --scholar-id (e.g. from your profile URL ?user=...)"
-            )
+
+        console.print(f"[cyan]Fetching publications from Google Scholar profile ({scholar_id})...[/cyan]")
+        try:
+            scholar_papers = scholar_client.get_author_papers(scholar_id)
+        except ScholarBlockedError as e:
+            console.print(f"[bold red]Google Scholar Error:[/bold red] {e}")
             raise typer.Exit(code=1)
 
-    console.print(f"[cyan]Fetching publications from Google Scholar profile ({scholar_id})...[/cyan]")
-    try:
-        scholar_papers = scholar_client.get_author_papers(scholar_id)
-    except ScholarBlockedError as e:
-        console.print(f"[bold red]Google Scholar Error:[/bold red] {e}")
-        raise typer.Exit(code=1)
-
-    console.print(f"[green]✓[/green] Found [bold]{len(scholar_papers)}[/bold] publications on Google Scholar.")
+        console.print(f"[green]✓[/green] Found [bold]{len(scholar_papers)}[/bold] publications on Google Scholar.")
+    else:
+        console.print("[cyan]Using OpenAlex open database for citation analysis (no Google scraping needed).[/cyan]")
 
     # 3. Cross-Check Citations
     console.print(
-        Panel("[bold]Starting Cross-Check between Google Scholar citations and Scopus...[/bold]\n"
-              f"Delay between Scholar calls: {scholar_delay}s\n"
+        Panel("[bold]Starting Cross-Check between academic citations and Scopus...[/bold]\n"
+              f"Source: {source} | Delay: {scholar_delay}s\n"
               "Checking citing papers against Scopus index...",
               border_style="blue")
     )
@@ -246,6 +255,11 @@ def check(
         author_last = author_display_name.strip().replace(",", " ").split()[-1]
     elif scopus_papers and scopus_papers[0].authors:
         author_last = scopus_papers[0].authors.split(",")[0].strip().split()[-1]
+
+    # Initialize clients based on selected source
+    from citation_tracker.openalex_client import OpenAlexClient
+    openalex_client = OpenAlexClient(cache=cache) if source in ("all", "openalex") else None
+    active_scholar_client = scholar_client if source in ("all", "scholar") else None
 
     with Progress(
         SpinnerColumn(),
@@ -259,7 +273,8 @@ def check(
 
         checker = CitationCrossChecker(
             scopus_client=scopus_client,
-            scholar_client=scholar_client,
+            scholar_client=active_scholar_client,
+            openalex_client=openalex_client,
             author_last_name=author_last,
             progress_callback=update_progress,
         )
