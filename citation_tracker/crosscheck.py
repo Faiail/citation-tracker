@@ -97,10 +97,18 @@ class CitationCrossChecker:
             # 1. Match Scopus paper with Scholar paper
             matched_scholar = match_scholar_paper(scopus_paper, scholar_papers) if scholar_papers else None
 
-            # 2. Get known Scopus citing documents for this paper (if refeid enabled)
+            # 2. Get known Scopus citing documents for this paper
             scopus_citing_eids = set()
             try:
-                scopus_citing_eids = self.scopus_client.get_citing_eids_for_paper(scopus_paper.eid)
+                author_last = self.author_last_name
+                if not author_last and scopus_paper.authors:
+                    author_last = scopus_paper.authors.split(",")[0].strip().split()[-1]
+
+                scopus_citing_eids = self.scopus_client.get_citing_eids_for_paper(
+                    cited_eid=scopus_paper.eid,
+                    title=scopus_paper.title,
+                    author=author_last,
+                )
                 scopus_paper.scopus_citing_eids = scopus_citing_eids
             except Exception as e:
                 logger.debug(f"Could not retrieve Scopus citing EIDs for {scopus_paper.eid}: {e}")

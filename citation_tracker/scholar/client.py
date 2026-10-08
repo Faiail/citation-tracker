@@ -168,12 +168,12 @@ class ScholarClient:
         while start < max_citations:
             url = f"https://scholar.google.com/scholar?cites={clean_cites_id}&hl=en&start={start}"
             try:
+                time.sleep(5)
                 resp = self._get_html(url)
             except ScholarBlockedError:
                 # If blocked, log and return what we have so far
                 logger.warning(f"Google Scholar rate-limited when fetching cites={clean_cites_id}")
                 break
-
             soup = BeautifulSoup(resp, "html.parser")
             entries = soup.select(".gs_r.gs_or.gs_scl")
             if not entries:

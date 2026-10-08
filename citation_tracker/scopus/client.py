@@ -216,41 +216,80 @@ class ScopusClient:
         self.cache.set("scopus_papers", cache_key, [p.model_dump() for p in papers])
         return papers
 
-    def get_citing_eids_for_paper(self, cited_eid: str) -> Set[str]:
-        """Attempt to query Scopus for citing EIDs (via refeid query).
+    def get_citing_eids_for_paper(
+        self,
+        cited_eid: str,
+        title: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> Set[str]:
+        """Query Scopus for all documents that cite a given paper.
         
-        Returns an empty set if the user's API key does not have entitlement for refeid.
+        Uses REFAUTH and REFTITLE for personal API keys (which don't have refeid entitlement),
+        with fallback to refeid for institutional keys.
         """
         clean_eid = cited_eid.strip()
         cache_key = f"citing_eids_{clean_eid}"
         cached = self.cache.get("scopus_citing_eids", cache_key)
-        if cached is not None:
+        if cached:
             return set(cached)
 
         citing_eids: Set[str] = set()
+
+        # Strategy 1: REFAUTH and REFTITLE using author and title
+        if author and title:
+            clean_title = re.sub(r'["{}\[\]\(\)]', '', title).strip()
+            if ":" in clean_title:
+                short_title = clean_title.split(":")[0].strip()
+            else:
+                words = clean_title.split()
+                short_title = " ".join(words[:4]) if len(words) >= 4 else clean_title
+
+            clean_author = author.strip().replace(",", " ").split()[-1]
+
+            # Try REFAUTH and REFTITLE
+            query = f'REFAUTH("{clean_author}") and REFTITLE("{short_title}")'
+            citing_eids = self._paginate_search_eids(query)
+
+            # If no results, try broader REF and REF
+            if not citing_eids:
+                query_ref = f'REF("{clean_author}") and REF("{short_title}")'
+                citing_eids = self._paginate_search_eids(query_ref)
+
+            if citing_eids:
+                self.cache.set("scopus_citing_eids", cache_key, list(citing_eids))
+                return citing_eids
+
+        # Strategy 2: refeid query (for institutional/campus network keys)
+        query_val = clean_eid
+        citing_eids = self._paginate_search_eids(f"refeid({query_val})")
+
+        if citing_eids:
+            self.cache.set("scopus_citing_eids", cache_key, list(citing_eids))
+        return citing_eids
+
+    def _paginate_search_eids(self, query: str, max_results: int = 200) -> Set[str]:
+        """Helper to paginate through Scopus search results and extract EIDs."""
+        eids: Set[str] = set()
         count = 25
         start = 0
         headers = self._headers()
-        query_val = clean_eid
 
         while True:
             params = {
-                "query": f"refeid({query_val})",
+                "query": query,
                 "count": count,
                 "start": start,
             }
             try:
                 resp = requests.get(SCOPUS_SEARCH_URL, headers=headers, params=params, timeout=25)
                 if resp.status_code == 400:
-                    # 'refeid' restriction not allowed for standard/personal keys
-                    logger.debug("refeid query restricted for this API key. Falling back to reference checks.")
                     break
                 if resp.status_code == 429:
                     raise ScopusAPIError("Elsevier API quota exceeded (Rate limit 429).")
                 resp.raise_for_status()
                 data = resp.json()
             except requests.RequestException as e:
-                logger.debug(f"refeid query unavailable: {e}")
+                logger.debug(f"Search query '{query}' failed: {e}")
                 break
 
             search_results = data.get("search-results", {})
@@ -263,15 +302,12 @@ class ScopusClient:
             for entry in entries:
                 eid = entry.get("eid")
                 if eid:
-                    citing_eids.add(eid)
+                    eids.add(eid)
 
             start += count
-            if start >= total_results:
+            if start >= total_results or start >= max_results:
                 break
-            time.sleep(0.2)
-
-        self.cache.set("scopus_citing_eids", cache_key, list(citing_eids))
-        return citing_eids
+        return eids
 
     def is_citation_tracked(
         self,
